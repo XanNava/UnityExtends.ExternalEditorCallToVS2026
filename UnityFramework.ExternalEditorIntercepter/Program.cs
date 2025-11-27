@@ -453,15 +453,29 @@ namespace VsInterceptor {
 				dynamic dteDynamic = dteObject;
 				string? solutionFullName = null;
 
-				try {
-					solutionFullName = dteDynamic?.Solution?.FullName as string;
-				}
-				catch (Exception solutionException) {
-					LogText("[TryGetDteForSolution] ERROR reading Solution.FullName: " + solutionException);
+				// ─────────────────────────────────────────────
+				// IMPORTANT: retry Solution.FullName on RPC_E_CALL_REJECTED
+				// ─────────────────────────────────────────────
+				const int maxAttempts = 5;
+				for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+					try {
+						solutionFullName = dteDynamic?.Solution?.FullName as string;
+						break; // success
+					}
+					catch (System.Runtime.InteropServices.COMException comException)
+						when ((uint)comException.ErrorCode == 0x80010001) { // RPC_E_CALL_REJECTED
+						LogText($"[TryGetDteForSolution] Solution.FullName RPC_E_CALL_REJECTED (attempt {attempt}/{maxAttempts}); retrying...");
+						Thread.Sleep(100); // small backoff, VS is busy
+					}
+					catch (Exception solutionException) {
+						LogText("[TryGetDteForSolution] ERROR reading Solution.FullName: " + solutionException);
+						// Non-busy error; no point retrying.
+						break;
+					}
 				}
 
 				if (string.IsNullOrEmpty(solutionFullName)) {
-					LogText("[TryGetDteForSolution] DTE instance has no loaded solution (Solution.FullName is null/empty).");
+					LogText("[TryGetDteForSolution] DTE instance has no loaded solution or is still busy after retries (Solution.FullName is null/empty).");
 					return false;
 				}
 
@@ -742,30 +756,88 @@ namespace VsInterceptor {
 			}
 		}
 
+		/// <summary>
+		/// Tries repeatedly (for a short time) to move the caret to the given line
+		/// in the active document. Wraps <see cref="TryGoToLineCore"/> with retries,
+		/// because VS sometimes hasn't finished activating the document yet.
+		/// </summary>
 		private static void TryGoToLine(object dteObject, Type dteType, int lineNumber) {
-			try {
-				object? activeDocumentObject = dteType.InvokeMember("ActiveDocument",
-					System.Reflection.BindingFlags.GetProperty, null, dteObject, null);
-				if (activeDocumentObject == null) {
-					LogText("[OpenFileViaDte] ActiveDocument is null after OpenFile.");
+			const int maxWaitMilliseconds = 3000;
+			const int stepMilliseconds = 50;
+
+			int accumulatedWait = 0;
+			while (accumulatedWait <= maxWaitMilliseconds) {
+				if (TryGoToLineCore(dteObject, dteType, lineNumber)) {
+					LogText("[OpenFileViaDte] GotoLine succeeded.");
 					return;
+				}
+
+				Thread.Sleep(stepMilliseconds);
+				accumulatedWait += stepMilliseconds;
+			}
+
+			LogText("[OpenFileViaDte] GotoLine retry timeout; giving up.");
+		}
+
+		/// <summary>
+		/// Single attempt to move the caret to the given line in the active document.
+		/// Returns true if it believes it succeeded, false if VS was not ready yet.
+		/// </summary>
+		private static bool TryGoToLineCore(object dteObject, Type dteType, int lineNumber) {
+			try {
+				object? activeDocumentObject = dteType.InvokeMember(
+					"ActiveDocument",
+					System.Reflection.BindingFlags.GetProperty,
+					null,
+					dteObject,
+					null);
+
+				if (activeDocumentObject == null) {
+					LogText("[OpenFileViaDte] ActiveDocument is null; VS probably has not activated the document yet.");
+					return false;
 				}
 
 				var activeDocumentType = activeDocumentObject.GetType();
-				object? selectionObject = activeDocumentType.GetProperty("Selection")?.GetValue(activeDocumentObject);
-				if (selectionObject == null) {
-					LogText("[OpenFileViaDte] ActiveDocument.Selection is null; cannot go to line.");
-					return;
+				string? activeFullName = activeDocumentType
+					.GetProperty("FullName")?
+					.GetValue(activeDocumentObject) as string;
+
+				LogText("[OpenFileViaDte] GotoLine: ActiveDocument.FullName='" + (activeFullName ?? "<null>") + "'");
+
+				object? selectionObject = activeDocumentType
+					.GetProperty("Selection")?
+					.GetValue(activeDocumentObject);
+
+				if (selectionObject != null) {
+					var selectionType = selectionObject.GetType();
+					selectionType.InvokeMember(
+						"GotoLine",
+						System.Reflection.BindingFlags.InvokeMethod,
+						null,
+						selectionObject,
+						new object[] { lineNumber, true });
+
+					LogText("[OpenFileViaDte] GotoLine(" + lineNumber + ") executed via TextSelection.");
+					return true;
 				}
 
-				var selectionType = selectionObject.GetType();
-				selectionType.InvokeMember("GotoLine",
-					System.Reflection.BindingFlags.InvokeMethod, null, selectionObject,
-					new object[] { lineNumber, true });
-				LogText("[OpenFileViaDte] GotoLine(" + lineNumber + ") executed.");
+				LogText("[OpenFileViaDte] ActiveDocument.Selection is null; falling back to ExecuteCommand('Edit.GoTo').");
+
+				// Fallback: ask VS to run the Edit.GoTo command itself.
+				object[] commandArguments = { "Edit.GoTo", lineNumber.ToString() };
+				dteType.InvokeMember(
+					"ExecuteCommand",
+					System.Reflection.BindingFlags.InvokeMethod,
+					null,
+					dteObject,
+					commandArguments);
+
+				LogText("[OpenFileViaDte] ExecuteCommand('Edit.GoTo " + lineNumber + "') invoked.");
+				return true;
 			}
 			catch (Exception exception) {
 				LogText("[OpenFileViaDte] ERROR while trying to go to line: " + exception);
+				return false;
 			}
 		}
 
